@@ -1,0 +1,83 @@
+# samconfig.toml — AWS SAM deployment configuration
+#
+# USAGE:
+#   sam build                         # build all Lambda functions + layer
+#   sam deploy --config-env dev       # deploy to dev (first time: adds --guided)
+#   sam deploy --config-env prod      # deploy to prod
+#
+# BEFORE FIRST DEPLOY:
+#   1. Copy this file to samconfig.toml
+#   2. Fill in the parameter_overrides below (WhatsApp tokens, phone number ID)
+#   3. Run: sam deploy --config-env dev --guided
+#      This will create/update the S3 deployment bucket and save choices back here.
+
+version = 0.1
+
+# ──────────────────────────────────────────────────
+# dev environment
+# ──────────────────────────────────────────────────
+[dev.deploy.parameters]
+stack_name          = "gramsetu-dev"
+region              = "ap-south-1"               # Mumbai — lowest latency to India
+capabilities        = "CAPABILITY_IAM"
+resolve_s3          = true
+s3_prefix           = "gramsetu-dev"
+confirm_changeset   = false                      # Non-interactive CI-friendly deploy
+disable_rollback    = false
+parameter_overrides = [
+  "Environment=dev",
+  "WhatsAppVerifyToken=REPLACE_ME_DEV_VERIFY_TOKEN",
+  "WhatsAppAccessToken=REPLACE_ME_DEV_ACCESS_TOKEN",
+  "WhatsAppPhoneNumberId=REPLACE_ME_PHONE_NUMBER_ID",
+  "BedrockModelId=anthropic.claude-3-haiku-20240307-v1:0",
+]
+tags = [
+  "Project=GramSetu",
+  "Environment=dev",
+]
+
+# ──────────────────────────────────────────────────
+# staging environment
+# ──────────────────────────────────────────────────
+[staging.deploy.parameters]
+stack_name          = "gramsetu-staging"
+region              = "ap-south-1"
+capabilities        = "CAPABILITY_IAM"
+resolve_s3          = true
+s3_prefix           = "gramsetu-staging"
+confirm_changeset   = true
+disable_rollback    = false
+parameter_overrides = [
+  "Environment=staging",
+  "WhatsAppVerifyToken=REPLACE_ME_STAGING_VERIFY_TOKEN",
+  "WhatsAppAccessToken=REPLACE_ME_STAGING_ACCESS_TOKEN",
+  "WhatsAppPhoneNumberId=REPLACE_ME_PHONE_NUMBER_ID",
+  "BedrockModelId=anthropic.claude-3-haiku-20240307-v1:0",
+]
+tags = [
+  "Project=GramSetu",
+  "Environment=staging",
+]
+
+# ──────────────────────────────────────────────────
+# prod environment
+# ──────────────────────────────────────────────────
+[prod.deploy.parameters]
+stack_name          = "gramsetu-prod"
+region              = "ap-south-1"
+capabilities        = "CAPABILITY_IAM"
+resolve_s3          = true
+s3_prefix           = "gramsetu-prod"
+confirm_changeset   = true                       # Always show changeset in prod
+disable_rollback    = false
+parameter_overrides = [
+  "Environment=prod",
+  "WhatsAppVerifyToken=REPLACE_ME_PROD_VERIFY_TOKEN",
+  "WhatsAppAccessToken=REPLACE_ME_PROD_ACCESS_TOKEN",
+  "WhatsAppPhoneNumberId=REPLACE_ME_PHONE_NUMBER_ID",
+  "BedrockModelId=anthropic.claude-3-haiku-20240307-v1:0",
+]
+tags = [
+  "Project=GramSetu",
+  "Environment=prod",
+]

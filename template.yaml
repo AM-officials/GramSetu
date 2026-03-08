@@ -1,0 +1,618 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  GramSetu — Serverless WhatsApp AI Agent for rural Indian government scheme access.
+  Deploys 5 Lambda functions, API Gateway, DynamoDB single-table, and S3 media bucket.
+
+# ═══════════════════════════════════════════════════════════════════
+# Parameters — all overridable at deploy time via samconfig.toml
+# ═══════════════════════════════════════════════════════════════════
+
+Parameters:
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment (controls log levels and retention)
+
+  WhatsAppVerifyToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      The verify token you set in the WhatsApp Business API webhook console.
+      Must match WHATSAPP_VERIFY_TOKEN env var in WebhookHandler.
+
+  WhatsAppAccessToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      Bearer token for WhatsApp Cloud API (used to send messages back).
+      Stored securely; never logged.
+
+  WhatsAppPhoneNumberId:
+    Type: String
+    Description: WhatsApp Business Account phone number ID (from Meta Developer Console).
+
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-haiku-20240307-v1:0
+    Description: >
+      Bedrock model ID for AIReasoner. Claude 3 Haiku is recommended for
+      low-latency + cost at this use-case scale.
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Globals — defaults applied to every Lambda function
+# ═══════════════════════════════════════════════════════════════════
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]            # Graviton2 — ~20% cheaper AND faster than x86
+    MemorySize: 512
+    Timeout: 60                       # WhatsApp requires 200ms response; processor is async
+    Tracing: Active                   # AWS X-Ray distributed tracing
+    Layers:
+      - !Ref GramSetuDependenciesLayer
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref GramSetuTable
+        MEDIA_BUCKET: !Ref GramSetuMediaBucket
+        ENVIRONMENT: !Ref Environment
+        POWERTOOLS_SERVICE_NAME: gramsetu
+        LOG_LEVEL: !If [IsProd, WARNING, INFO]
+    Tags:
+      Project: GramSetu
+      Environment: !Ref Environment
+      ManagedBy: SAM
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Conditions
+# ═══════════════════════════════════════════════════════════════════
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Resources
+# ═══════════════════════════════════════════════════════════════════
+
+Resources:
+
+  # ─────────────────────────────────────────────────────────────────
+  # Lambda Layer — shared Python dependencies (pydantic, boto3, etc.)
+  # ─────────────────────────────────────────────────────────────────
+
+  GramSetuDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub gramsetu-dependencies-${Environment}
+      Description: Shared Python deps — pydantic, boto3, python-dotenv, httpx
+      ContentUri: layer/
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [arm64]
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.12
+
+
+  # ─────────────────────────────────────────────────────────────────
+  # DynamoDB — Single-Table Design
+  # PK (Partition Key) : string  e.g. USER#<phone>, SCHEME#<id>
+  # SK (Sort Key)      : string  e.g. PROFILE, STATE, DOC#<type>#<ts>
+  # GSI1               : list-all-active-schemes access pattern
+  # ─────────────────────────────────────────────────────────────────
+
+  # ─────────────────────────────────────────────────────────────────
+  # DynamoDB — Session Table
+  # Stores per-user extracted document data for 15-minute cross-message
+  # context so the AI never asks for already-uploaded documents.
+  # PK: PhoneNumber (String) — WhatsApp E.164 number without leading '+'
+  # TTL: ttl (Number) — auto-expire items after 15 minutes
+  # ─────────────────────────────────────────────────────────────────
+
+  GramSetuSessionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub gramsetu-sessions-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: PhoneNumber
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PhoneNumber
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: GramSetu
+        - Key: Environment
+          Value: !Ref Environment
+
+
+  GramSetuTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain             # Never auto-delete data, even on stack delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub gramsetu-${Environment}
+      BillingMode: PAY_PER_REQUEST     # On-demand — no capacity planning needed for MVP
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true               # AES-256 server-side encryption at rest
+      TableClass: STANDARD
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl             # ConversationState items expire after 24h
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: GramSetu
+        - Key: Environment
+          Value: !Ref Environment
+
+
+  # ─────────────────────────────────────────────────────────────────
+  # S3 Bucket — media ingress + PDF egress
+  # Sub-folders (prefix convention):
+  #   incoming/<phone>/<media_id>.<ext>  — raw WhatsApp media downloads
+  #   generated/<phone>/<scheme>.pdf     — pre-filled government forms
+  # ─────────────────────────────────────────────────────────────────
+
+  GramSetuMediaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub gramsetu-media-${AWS::AccountId}-${Environment}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireIncomingMedia
+            Status: Enabled
+            Prefix: incoming/
+            ExpirationInDays: 30    # Raw audio/images kept for 30 days, then auto-purged
+          - Id: ExpireGeneratedPDFs
+            Status: Enabled
+            Prefix: generated/
+            ExpirationInDays: 90    # Generated PDFs retained for 90 days
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [GET]
+            AllowedOrigins: ["*"]
+            MaxAge: 3600
+      Tags:
+        - Key: Project
+          Value: GramSetu
+        - Key: Environment
+          Value: !Ref Environment
+
+
+  # ─────────────────────────────────────────────────────────────────
+  # CloudWatch Log Groups — explicit groups with retention policies
+  # ─────────────────────────────────────────────────────────────────
+
+  WebhookHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/gramsetu-webhook-${Environment}
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  VoiceProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/gramsetu-voice-processor-${Environment}
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  DocumentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/gramsetu-document-processor-${Environment}
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  AIReasonerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/gramsetu-ai-reasoner-${Environment}
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  PDFGeneratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/gramsetu-pdf-generator-${Environment}
+      RetentionInDays: !If [IsProd, 90, 14]
+
+
+  # ─────────────────────────────────────────────────────────────────
+  # Lambda 1 — WebhookHandler
+  #
+  # Trigger : API Gateway HTTP API (GET + POST /webhook)
+  # Role    : DynamoDB r/w · invoke downstream Lambdas · S3 presigned URL generation
+  # Timeout : 10s (WhatsApp expects 200 OK within 20s; we respond fast and fan out async)
+  # ─────────────────────────────────────────────────────────────────
+
+  WebhookHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub gramsetu-webhook-${Environment}
+      CodeUri: .
+      Handler: src.webhook_handler.main.handler  # Mangum ASGI adapter wrapping FastAPI app
+      Description: Receives WhatsApp Business API webhooks, fans out to processor Lambdas
+      MemorySize: 256                 # Webhook handler is lightweight; 256 MB is plenty
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref WebhookHandlerLogGroup
+      Environment:
+        Variables:
+          WHATSAPP_VERIFY_TOKEN: !Ref WhatsAppVerifyToken
+          WHATSAPP_ACCESS_TOKEN: !Ref WhatsAppAccessToken
+          WHATSAPP_API_TOKEN: EAAUDkoRPZBB4BQyjZAOzYnasvroZCW3yeYr9AMYWae83tA2yvGnbROj0VnO33h2wee9ht2bdi6pWmGtsKFvhFJ0DwiE72y5ULHH6RNBHnjAZCgIWgxnl7m9ReJP3yls0QhvbEfM0iz4DkXoRKo9VZA2DQhLnNVknZBtvFHYpTFVZC4CGgznQ8zk18tZB1DTeiRlZAttjtCSzFZCm8el62j2wcI8djKM4NBMdvezLsWD4CdCIwqPC749H1HJ3x0rLYJlTVbP6ZCY6FN0TBI0rsJgGH1o
+          WHATSAPP_PHONE_NUMBER_ID: !Ref WhatsAppPhoneNumberId
+          GEMINI_API_KEY: AIzaSyBdi5IWcsVlnYjp9wZrAeum-Lw0Yhtyw9Q
+          SESSION_TABLE_NAME: !Ref GramSetuSessionsTable
+          VOICE_PROCESSOR_FUNCTION: !Ref VoiceProcessorFunction
+          DOCUMENT_PROCESSOR_FUNCTION: !Ref DocumentProcessorFunction
+          AI_REASONER_FUNCTION: !Ref AIReasonerFunction
+          PDF_GENERATOR_FUNCTION: !Ref PDFGeneratorFunction
+      Events:
+        WebhookVerify:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GramSetuHttpApi
+            Path: /webhook
+            Method: GET
+        WebhookReceive:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GramSetuHttpApi
+            Path: /webhook
+            Method: POST
+      Policies:
+        # DynamoDB — read & write user profiles and conversation state
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GramSetuTable
+        # DynamoDB — read & write 15-minute session cache
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+              Resource: !GetAtt GramSetuSessionsTable.Arn
+        # Invoke VoiceProcessor, DocumentProcessor, AIReasoner, PDFGenerator
+        - LambdaInvokePolicy:
+            FunctionName: !Ref VoiceProcessorFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DocumentProcessorFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AIReasonerFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PDFGeneratorFunction
+        # S3 — read media bucket for presigned URL generation
+        - S3ReadPolicy:
+            BucketName: !Ref GramSetuMediaBucket
+        # AWS Bedrock — invoke Claude for in-process reasoning
+        - Statement:
+          - Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: "*"
+
+
+  # ─────────────────────────────────────────────────────────────────
+  # Lambda 2 — VoiceProcessor
+  #
+  # Trigger : Async invocation from WebhookHandler
+  # Role    : S3 r/w (download voice file) · AWS Transcribe · DynamoDB r/w
+  # Timeout : 120s (Transcribe async jobs can take up to 60s for short clips)
+  # ─────────────────────────────────────────────────────────────────
+
+  VoiceProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub gramsetu-voice-processor-${Environment}
+      CodeUri: .
+      Handler: src.voice_processor.processor.handler
+      Description: Downloads WhatsApp audio, calls AWS Transcribe, returns transcription
+      MemorySize: 512
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref VoiceProcessorLogGroup
+      Environment:
+        Variables:
+          AI_REASONER_FUNCTION: !Ref AIReasonerFunction
+          TRANSCRIBE_OUTPUT_BUCKET: !Ref GramSetuMediaBucket
+      Policies:
+        # DynamoDB
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GramSetuTable
+        # S3 — download incoming voice files + write Transcribe output
+        - S3CrudPolicy:
+            BucketName: !Ref GramSetuMediaBucket
+        # AWS Transcribe — start and poll transcription jobs
+        - Statement:
+            - Effect: Allow
+              Action:
+                - transcribe:StartTranscriptionJob
+                - transcribe:GetTranscriptionJob
+                - transcribe:ListTranscriptionJobs
+                - transcribe:DeleteTranscriptionJob
+              Resource: "*"
+        # Invoke AIReasoner with the transcription result
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AIReasonerFunction
+        # AWS Bedrock — invoke Claude for in-process reasoning
+        - Statement:
+          - Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: "*"
+
+
+  # ─────────────────────────────────────────────────────────────────
+  # Lambda 3 — DocumentProcessor
+  #
+  # Trigger : Async invocation from WebhookHandler
+  # Role    : S3 r/w (download image) · AWS Textract · DynamoDB r/w
+  # Timeout : 60s (Textract AnalyzeDocument is synchronous, usually < 10s)
+  # ─────────────────────────────────────────────────────────────────
+
+  DocumentProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub gramsetu-document-processor-${Environment}
+      CodeUri: .
+      Handler: src.document_processor.processor.handler
+      Description: Downloads document photo, calls AWS Textract, extracts form fields
+      MemorySize: 512
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref DocumentProcessorLogGroup
+      Environment:
+        Variables:
+          AI_REASONER_FUNCTION: !Ref AIReasonerFunction
+      Policies:
+        # DynamoDB
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GramSetuTable
+        # S3 — download incoming document images (Textract can read directly from S3)
+        - S3CrudPolicy:
+            BucketName: !Ref GramSetuMediaBucket
+        # AWS Textract — analyze documents and detect text
+        - Statement:
+            - Effect: Allow
+              Action:
+                - textract:AnalyzeDocument
+                - textract:DetectDocumentText
+                - textract:AnalyzeID
+                - textract:GetDocumentAnalysis
+                - textract:StartDocumentAnalysis
+              Resource: "*"
+        # Invoke AIReasoner with extracted fields
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AIReasonerFunction
+        # AWS Bedrock — invoke Claude for in-process reasoning
+        - Statement:
+          - Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: "*"
+
+
+  # ─────────────────────────────────────────────────────────────────
+  # Lambda 4 — AIReasoner
+  #
+  # Trigger : Sync/async invocation from VoiceProcessor or DocumentProcessor
+  # Role    : DynamoDB r/w · AWS Bedrock (Claude) · invoke PDFGenerator
+  # Timeout : 60s (Bedrock InvokeModel can take up to 30s for complex prompts)
+  # ─────────────────────────────────────────────────────────────────
+
+  AIReasonerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub gramsetu-ai-reasoner-${Environment}
+      CodeUri: .
+      Handler: src.ai_reasoner.prompts.handler
+      Description: Invokes Claude via Bedrock to extract entities and drive conversation
+      MemorySize: 1024                # LLM response parsing benefits from more RAM
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref AIReasonerLogGroup
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          GEMINI_API_KEY: AIzaSyBdi5IWcsVlnYjp9wZrAeum-Lw0Yhtyw9Q
+          PDF_GENERATOR_FUNCTION: !Ref PDFGeneratorFunction
+      Policies:
+        # DynamoDB — read conversation state + write extracted user data
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GramSetuTable
+        # AWS Bedrock — invoke Claude 3 Sonnet (wildcard for hackathon demo)
+        - Statement:
+          - Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: "*"
+        # Invoke PDFGenerator once all data is confirmed
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PDFGeneratorFunction
+
+
+  # ─────────────────────────────────────────────────────────────────
+  # Lambda 5 — PDFGenerator
+  #
+  # Trigger : Sync invocation from AIReasoner
+  # Role    : DynamoDB r/w · S3 write (PDFs) · Presigned URL generation
+  # Timeout : 30s (PDF generation with WeasyPrint/PyMuPDF is CPU-intensive)
+  # ─────────────────────────────────────────────────────────────────
+
+  PDFGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub gramsetu-pdf-generator-${Environment}
+      CodeUri: .
+      Handler: src.pdf_generator.generator.handler
+      Description: Fills government form PDF templates and uploads to S3
+      MemorySize: 1024                # PDF rendering is memory-hungry
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref PDFGeneratorLogGroup
+      Environment:
+        Variables:
+          PDF_FORMS_PREFIX: generated/
+          FORM_TEMPLATES_PREFIX: templates/
+      Policies:
+        # DynamoDB — read user data, write generated PDF record
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GramSetuTable
+        # S3 — write generated PDFs + read form templates stored in bucket
+        - S3CrudPolicy:
+            BucketName: !Ref GramSetuMediaBucket
+
+
+  # ─────────────────────────────────────────────────────────────────
+  # API Gateway — HTTP API (cheaper than REST API; ~$1/million vs $3.50)
+  # ─────────────────────────────────────────────────────────────────
+
+  GramSetuHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      Description: GramSetu WhatsApp Webhook endpoint
+      DisableExecuteApiEndpoint: false
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100     # Protect against sudden traffic spikes
+        ThrottlingRateLimit: 50       # Requests per second
+      Auth:
+        EnableIamAuthorizer: false    # Public endpoint — WhatsApp calls this directly
+      Tags:
+        Project: GramSetu
+        Environment: !Ref Environment
+
+
+  # ─────────────────────────────────────────────────────────────────
+  # CloudWatch Alarms — basic operational visibility
+  # ─────────────────────────────────────────────────────────────────
+
+  # Alert when Webhook Lambda error rate exceeds 5% over 5 minutes
+  WebhookErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub gramsetu-webhook-errors-${Environment}
+      AlarmDescription: "WebhookHandler Lambda error rate > 5% over 5 minutes"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WebhookHandlerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # Alert when Bedrock calls consistently time out or error
+  AIReasonerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub gramsetu-ai-reasoner-errors-${Environment}
+      AlarmDescription: "AIReasoner Lambda error rate > 3 per 5 minutes"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AIReasonerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Outputs — values referenced by the WhatsApp Business API console
+# ═══════════════════════════════════════════════════════════════════
+
+Outputs:
+
+  WebhookUrl:
+    Description: >
+      Paste this URL into the Meta Developer Console → WhatsApp → Configuration → Webhook URL.
+      This is the public endpoint WhatsApp will POST incoming messages to.
+    Value: !Sub https://${GramSetuHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/webhook
+    Export:
+      Name: !Sub GramSetu-WebhookUrl-${Environment}
+
+  DynamoTableName:
+    Description: GramSetu single-table DynamoDB table name
+    Value: !Ref GramSetuTable
+    Export:
+      Name: !Sub GramSetu-TableName-${Environment}
+
+  MediaBucketName:
+    Description: S3 bucket for incoming media and generated PDFs
+    Value: !Ref GramSetuMediaBucket
+    Export:
+      Name: !Sub GramSetu-MediaBucket-${Environment}
+
+  WebhookHandlerArn:
+    Description: ARN of the WebhookHandler Lambda
+    Value: !GetAtt WebhookHandlerFunction.Arn
+
+  VoiceProcessorArn:
+    Description: ARN of the VoiceProcessor Lambda
+    Value: !GetAtt VoiceProcessorFunction.Arn
+
+  DocumentProcessorArn:
+    Description: ARN of the DocumentProcessorFunction Lambda
+    Value: !GetAtt DocumentProcessorFunction.Arn
+
+  AIReasonerArn:
+    Description: ARN of the AIReasoner Lambda
+    Value: !GetAtt AIReasonerFunction.Arn
+
+  PDFGeneratorArn:
+    Description: ARN of the PDFGenerator Lambda
+    Value: !GetAtt PDFGeneratorFunction.Arn

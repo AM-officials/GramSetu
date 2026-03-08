@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+samconfig.toml
+
+# Temporary media files (downloaded by download_whatsapp_media)
+temp_media/
+
+# AWS SAM
+.aws-sam/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / generated artifacts
+test_output.txt
+walkthrough.md.resolved
+.kiro/

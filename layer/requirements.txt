@@ -1,0 +1,11 @@
+# Lambda Layer dependencies
+# These are installed into the layer at sam build time.
+# All src/ packages import from these; keeping them in a layer
+# avoids re-bundling in every function's deployment zip.
+
+pydantic>=2.0,<3.0
+boto3>=1.34,<2.0
+python-dotenv>=1.0,<2.0
+httpx>=0.27,<1.0
+mangum>=0.17,<1.0     # ASGI adapter — wraps FastAPI app for Lambda handler
+fastapi>=0.111,<1.0
