@@ -33,10 +33,9 @@
 
 <div align="center">
 
-| Welcome & Scheme Selection | Document Upload & OCR | Eligibility & Submission |
+| | | |
 |:---:|:---:|:---:|
-| ![Welcome](docs/screenshots/welcome.jpg) | ![Document OCR](docs/screenshots/document_ocr.jpg) | ![Submission](docs/screenshots/submission.jpg) |
-| Bilingual welcome + scheme picker | Gemini extracts data from Aadhaar photo | Auto-generates reference number |
+| ![Demo 1](public/demo1.jpeg) | ![Demo 2](public/demo2.jpeg) | ![Demo 3](public/demo3.jpeg) |
 
 </div>
 
@@ -100,6 +99,13 @@ flowchart TD
 ---
 
 ## ✨ Features
+
+<div align="center">
+
+![GramSetu Features](public/features.png)
+
+</div>
+
 
 | Feature | Description |
 |---|---|
